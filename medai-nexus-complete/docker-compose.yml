@@ -1,0 +1,153 @@
+version: "3.9"
+
+# ─── MedAI Nexus — Full Production Stack ─────
+# Services: FastAPI · PostgreSQL · Redis · ChromaDB · Nginx
+#
+# Usage:
+#   Development:  docker compose up --build
+#   Production:   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+name: medai-nexus
+
+networks:
+  medai_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  chroma_data:
+  uploads_data:
+
+
+services:
+
+  # ─── PostgreSQL ──────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: medai_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     medai
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-medai_secure_pw}
+      POSTGRES_DB:       medai_nexus
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/migrations/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - medai_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medai -d medai_nexus"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Redis ──────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: medai_redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:-redis_secure_pw} --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - medai_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ─── ChromaDB Vector Store ───────────────────
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: medai_chroma
+    restart: unless-stopped
+    environment:
+      CHROMA_SERVER_AUTH_CREDENTIALS_PROVIDER: chromadb.auth.token.TokenConfigServerAuthCredentialsProvider
+      CHROMA_SERVER_AUTH_TOKEN_TRANSPORT_HEADER: AUTHORIZATION
+      CHROMA_AUTH_TOKEN_TRANSPORT_HEADER: AUTHORIZATION
+    volumes:
+      - chroma_data:/chroma/chroma
+    ports:
+      - "8001:8000"
+    networks:
+      - medai_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+
+  # ─── FastAPI Backend ─────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: medai_backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL:  postgresql+asyncpg://medai:${POSTGRES_PASSWORD:-medai_secure_pw}@postgres:5432/medai_nexus
+      REDIS_URL:     redis://:${REDIS_PASSWORD:-redis_secure_pw}@redis:6379/0
+      CHROMA_HOST:   chromadb
+      CHROMA_PORT:   8000
+    volumes:
+      - uploads_data:/app/uploads
+      - ./backend:/app              # hot-reload in dev
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+    networks:
+      - medai_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 3
+
+  # ─── Next.js Frontend ────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL:      http://backend:8000
+        NEXT_PUBLIC_WS_URL:       ws://backend:8000
+        NEXT_PUBLIC_GOOGLE_MAPS:  ${GOOGLE_MAPS_KEY:-}
+    container_name: medai_frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - medai_net
+
+  # ─── Nginx Reverse Proxy ──────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: medai_nginx
+    restart: unless-stopped
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - medai_net
